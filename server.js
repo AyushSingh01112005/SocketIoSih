@@ -22,8 +22,12 @@ const allowedOrigins = [
   "https://sih-26-cyan.vercel.app",
   "https://sih-26-beta.vercel.app",
   "http://localhost:3000",
+  "http://localhost:3001",
   "http://localhost:5000",
 ];
+
+// Remove duplicates
+const uniqueAllowedOrigins = [...new Set(allowedOrigins)];
 
 // =====================================================
 // EXPRESS MIDDLEWARE
@@ -34,27 +38,24 @@ app.use(express.json());
 app.use(
   cors({
     origin: (origin, callback) => {
-      // ESP32 / Postman / server-to-server requests
+      // ESP32 / Postman / server-to-server
       if (!origin) {
+        console.log("[CORS] Request without Origin header");
         return callback(null, true);
       }
 
-      if (allowedOrigins.includes(origin)) {
+      if (uniqueAllowedOrigins.includes(origin)) {
+        console.log(`[CORS] Allowed origin: ${origin}`);
         return callback(null, true);
       }
 
-      console.warn(
-        `[CORS Warning] Origin not in whitelist: ${origin}`
-      );
+      console.warn(`[CORS] Unknown origin: ${origin}`);
 
-      // Currently allowing unmatched origins.
-      // For strict CORS use:
-      // return callback(new Error("Not allowed by CORS"));
-
+      // Keep open for debugging.
       return callback(null, true);
     },
 
-    methods: ["GET", "POST"],
+    methods: ["GET", "POST", "OPTIONS"],
     credentials: true,
   })
 );
@@ -65,11 +66,17 @@ app.use(
 
 app.use((req, res, next) => {
   console.log(
-    `[HTTP Request] ${new Date().toISOString()} | ${req.method} ${req.url} | IP: ${req.ip}`
+    `[HTTP] ${new Date().toISOString()} | ${req.method} ${req.url} | IP: ${req.ip}`
   );
 
   next();
 });
+
+// =====================================================
+// DEVICE STORAGE
+// =====================================================
+
+const devices = new Map();
 
 // =====================================================
 // SOCKET.IO SERVER
@@ -77,79 +84,96 @@ app.use((req, res, next) => {
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: uniqueAllowedOrigins,
     methods: ["GET", "POST"],
     credentials: true,
   },
 
-  // Socket.IO heartbeat
+  // Important for Render/cloud proxy
   pingInterval: 25000,
   pingTimeout: 20000,
 
-  // Allow both transports
-  transports: ["websocket"],
+  // Allow both browser and ESP32
+  transports: ["websocket", "polling"],
 
   connectTimeout: 45000,
+
+  // Allow clients to reconnect
+  allowEIO3: false,
 });
 
 // =====================================================
-// ENGINE.IO CONNECTION ERROR LOGGER
+// ENGINE.IO CONNECTION ERROR
 // =====================================================
 
 io.engine.on("connection_error", (err) => {
-  console.error("\n==============================================");
+  console.error("");
+  console.error("==================================================");
   console.error("❌ ENGINE.IO CONNECTION ERROR");
-  console.error("==============================================");
+  console.error("==================================================");
 
-  console.error("Code    :", err.code);
-  console.error("Message :", err.message);
-  console.error("Context :", err.context);
+  console.error("Code:", err.code);
+  console.error("Message:", err.message);
+  console.error("Context:", err.context);
 
   if (err.req) {
-    console.error("URL     :", err.req.url);
+    console.error("URL:", err.req.url);
 
     console.error(
-      "Origin  :",
+      "Origin:",
       err.req.headers?.origin || "NO_ORIGIN"
     );
 
     console.error(
-      "Agent   :",
+      "User-Agent:",
       err.req.headers?.["user-agent"] || "NO_USER_AGENT"
+    );
+
+    console.error(
+      "Remote Address:",
+      err.req.socket?.remoteAddress || "UNKNOWN"
     );
   }
 
-  console.error("==============================================\n");
+  console.error("==================================================");
+  console.error("");
 });
 
 // =====================================================
-// DEVICE TRACKING
+// ENGINE.IO CONNECTION
 // =====================================================
 
-const devices = new Map();
+io.engine.on("connection", (engineSocket) => {
+  console.log("");
+  console.log("--------------------------------------------------");
+  console.log("🔌 ENGINE.IO CONNECTION");
+  console.log("--------------------------------------------------");
+  console.log("Engine Socket ID:", engineSocket.id);
+  console.log("Transport:", engineSocket.transport.name);
+  console.log("Time:", new Date().toISOString());
+  console.log("--------------------------------------------------");
+});
 
 // =====================================================
-// HELPER: IDENTIFY CLIENT
+// CLIENT IDENTIFICATION
 // =====================================================
 
 function identifyClient(socket) {
   const origin =
-    socket.handshake.headers.origin || "NO_ORIGIN";
+    socket.handshake.headers?.origin || "NO_ORIGIN";
 
   const userAgent =
-    socket.handshake.headers["user-agent"] ||
+    socket.handshake.headers?.["user-agent"] ||
     "NO_USER_AGENT";
 
   let clientType = "UNKNOWN";
 
   if (
-    origin ===
-    "https://sih-26-cyan.vercel.app"
+    origin === "https://sih-26-cyan.vercel.app"
   ) {
     clientType = "VERCEL_FRONTEND";
   } else if (
-    origin ===
-    "https://sih-26-beta.vercel.app"
+    origin === "https://sih-26-beta.vercel.app"
   ) {
     clientType = "VERCEL_BETA";
   } else if (origin === "NO_ORIGIN") {
@@ -164,7 +188,7 @@ function identifyClient(socket) {
 }
 
 // =====================================================
-// CONNECTION STATUS MONITOR
+// CONNECTION STATUS
 // =====================================================
 
 function printConnectionStatus() {
@@ -174,16 +198,14 @@ function printConnectionStatus() {
 
   const totalConnections = sockets.length;
 
-  // ESP32 devices are identified after deviceConnected
   const esp32Connections = sockets.filter(
-    (socket) => socket.deviceId
+    (socket) => !!socket.deviceId
   ).length;
 
-  // Browser/frontend connections
   const frontendConnections = sockets.filter(
     (socket) => {
       const origin =
-        socket.handshake.headers.origin;
+        socket.handshake.headers?.origin;
 
       return (
         origin ===
@@ -194,9 +216,16 @@ function printConnectionStatus() {
     }
   ).length;
 
-  console.log("\n==============================================");
-  console.log("📊 SiloSense CONNECTION STATUS");
-  console.log("==============================================");
+  const connectedDevices = Array.from(
+    devices.values()
+  ).filter(
+    (device) => device.connected === true
+  );
+
+  console.log("");
+  console.log("==================================================");
+  console.log("📊 SILOSENSE CONNECTION STATUS");
+  console.log("==================================================");
 
   console.log(
     "Total Socket Connections :",
@@ -213,107 +242,119 @@ function printConnectionStatus() {
     frontendConnections
   );
 
-  // -----------------------------------------------
-  // Overall status
-  // -----------------------------------------------
+  console.log(
+    "Registered Devices       :",
+    devices.size
+  );
+
+  console.log(
+    "Connected Devices        :",
+    connectedDevices.length
+  );
+
+  // ---------------------------------------------------
+  // Socket status
+  // ---------------------------------------------------
 
   if (totalConnections === 0) {
-    console.log("⚠️ NO CLIENTS CONNECTED");
+    console.log("⚠️ NO SOCKET CLIENTS CONNECTED");
   } else {
-    console.log(
-      "🟢 SOCKET.IO CLIENT(S) CONNECTED"
-    );
+    console.log("🟢 SOCKET CLIENT(S) CONNECTED");
   }
 
-  // -----------------------------------------------
+  // ---------------------------------------------------
   // ESP32 status
-  // -----------------------------------------------
+  // ---------------------------------------------------
 
   if (esp32Connections === 0) {
-    console.log(
-      "⚠️ NO ESP32 DEVICE CONNECTED"
-    );
+    console.log("🔴 NO ESP32 DEVICE CONNECTED");
   } else {
     console.log(
       `🟢 ${esp32Connections} ESP32 DEVICE(S) CONNECTED`
     );
   }
 
-  // -----------------------------------------------
+  // ---------------------------------------------------
   // Frontend status
-  // -----------------------------------------------
+  // ---------------------------------------------------
 
   if (frontendConnections === 0) {
-    console.log(
-      "⚠️ NO VERCEL FRONTEND CONNECTED"
-    );
+    console.log("⚪ NO VERCEL FRONTEND CONNECTED");
   } else {
     console.log(
       `🟢 ${frontendConnections} FRONTEND CLIENT(S) CONNECTED`
     );
   }
 
-  // -----------------------------------------------
-  // Registered device information
-  // -----------------------------------------------
+  // ---------------------------------------------------
+  // Registered devices
+  // ---------------------------------------------------
 
-  console.log(
-    "Registered Devices       :",
-    devices.size
-  );
+  if (devices.size === 0) {
+    console.log("");
+    console.log("📋 REGISTERED DEVICES: NONE");
+  } else {
+    console.log("");
+    console.log("📋 REGISTERED DEVICES:");
 
-  const registeredDevices = Array.from(
-    devices.values()
-  );
-
-  if (registeredDevices.length > 0) {
-    console.log("\n📋 REGISTERED DEVICES:");
-
-    registeredDevices.forEach((device) => {
+    for (const device of devices.values()) {
       console.log(
-        `   ${device.connected ? "🟢" : "🔴"} ${device.deviceId} | Connected: ${device.connected} | Last Seen: ${device.lastSeen}`
+        `   ${
+          device.connected ? "🟢" : "🔴"
+        } ${device.deviceId} | ` +
+          `Connected: ${device.connected} | ` +
+          `Last Seen: ${device.lastSeen} | ` +
+          `Socket: ${device.socketId || "NONE"}`
       );
-    });
+    }
   }
 
+  console.log("");
   console.log(
-    "\nTime :",
+    "🕒 Time:",
     new Date().toISOString()
   );
 
-  console.log(
-    "==============================================\n"
-  );
+  console.log("==================================================");
+  console.log("");
 }
 
 // =====================================================
-// PRINT STATUS EVERY 10 SECONDS
+// STATUS MONITOR
 // =====================================================
+
+// Print every 10 seconds.
+// This happens even when NOTHING is connected.
 
 setInterval(() => {
   printConnectionStatus();
 }, 10000);
 
 // =====================================================
-// SERVER HEALTH ENDPOINT
+// SERVER HEALTH
 // =====================================================
 
 app.get("/", (req, res) => {
-  const connectedDevices =
-    Array.from(devices.values()).filter(
-      (device) => device.connected === true
-    ).length;
+  const connectedDevices = Array.from(
+    devices.values()
+  ).filter(
+    (device) => device.connected === true
+  ).length;
 
   const activeSocketConnections =
     io.sockets.sockets.size;
 
   res.status(200).json({
     success: true,
+
     service: "SiloSense Socket Server",
+
     status: "running",
 
     connectedDevices,
+
     totalRegisteredDevices: devices.size,
+
     activeSocketConnections,
 
     timestamp: new Date().toISOString(),
@@ -321,21 +362,62 @@ app.get("/", (req, res) => {
 });
 
 // =====================================================
-// INTERNAL SENSOR SAVED ENDPOINT
+// SOCKET.IO HEALTH ENDPOINT
+// =====================================================
+
+app.get("/socket-health", (req, res) => {
+  const sockets = Array.from(
+    io.sockets.sockets.values()
+  );
+
+  res.status(200).json({
+    success: true,
+
+    socketServer: "online",
+
+    totalConnections: sockets.length,
+
+    esp32Connections: sockets.filter(
+      (socket) => !!socket.deviceId
+    ).length,
+
+    frontendConnections: sockets.filter(
+      (socket) => {
+        const origin =
+          socket.handshake.headers?.origin;
+
+        return (
+          origin ===
+            "https://sih-26-cyan.vercel.app" ||
+          origin ===
+            "https://sih-26-beta.vercel.app"
+        );
+      }
+    ).length,
+
+    registeredDevices: devices.size,
+
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// =====================================================
+// INTERNAL SENSOR SAVED
 // =====================================================
 
 app.post(
   "/internal/sensor-saved",
   (req, res) => {
+    console.log("");
     console.log(
-      "\n[HTTP Log] POST /internal/sensor-saved -> Event received"
+      "[HTTP] POST /internal/sensor-saved"
     );
 
     const data = req.body;
 
     if (!data) {
       console.error(
-        "[HTTP Error] Missing body payload!"
+        "[HTTP] ❌ Missing request body"
       );
 
       return res.status(400).json({
@@ -345,7 +427,7 @@ app.post(
     }
 
     console.log(
-      "📡 [Broadcast] Emitting 'sensor:saved' to all clients"
+      "📡 Broadcasting sensor:saved"
     );
 
     io.emit("sensor:saved", data);
@@ -359,44 +441,33 @@ app.post(
 );
 
 // =====================================================
-// SOCKET.IO CONNECTION ENGINE
+// SOCKET.IO CONNECTION
 // =====================================================
 
 io.on("connection", (socket) => {
-  const transportName =
-    socket.conn.transport.name;
-
   const clientInfo =
     identifyClient(socket);
 
-  // ===================================================
-  // CONNECTION LOG
-  // ===================================================
+  const transport =
+    socket.conn.transport.name;
+
+  console.log("");
+  console.log("==================================================");
+  console.log("🟢 SOCKET.IO CLIENT CONNECTED");
+  console.log("==================================================");
 
   console.log(
-    "\n=============================================="
-  );
-
-  console.log(
-    "🟢 SOCKET.IO CLIENT CONNECTED"
-  );
-
-  console.log(
-    "=============================================="
-  );
-
-  console.log(
-    "Socket ID :",
+    "Socket ID:",
     socket.id
   );
 
   console.log(
-    "Client    :",
+    "Client:",
     clientInfo.clientType
   );
 
   console.log(
-    "Origin    :",
+    "Origin:",
     clientInfo.origin
   );
 
@@ -406,96 +477,98 @@ io.on("connection", (socket) => {
   );
 
   console.log(
-    "IP        :",
+    "IP:",
     socket.handshake.address
   );
 
   console.log(
-    "Transport :",
-    transportName
+    "Transport:",
+    transport
   );
 
   console.log(
-    "Time      :",
+    "Time:",
     new Date().toISOString()
   );
 
-  console.log(
-    "==============================================\n"
-  );
+  console.log("==================================================");
+  console.log("");
 
-  // Immediately print current status
+  // Print status immediately
   printConnectionStatus();
 
   // ===================================================
   // TRANSPORT UPGRADE
   // ===================================================
 
-  socket.conn.on("upgrade", (transport) => {
-    console.log(
-      `⚡ [Transport Upgrade] Socket ${socket.id} -> ${transport.name}`
-    );
-  });
+  socket.conn.on(
+    "upgrade",
+    (transport) => {
+      console.log(
+        `⚡ Transport upgraded: ${socket.id} -> ${transport.name}`
+      );
+    }
+  );
 
   // ===================================================
-  // ESP32 DEVICE REGISTRATION
+  // DEVICE CONNECTED
   // ===================================================
 
   socket.on(
     "deviceConnected",
     (data) => {
+      console.log("");
       console.log(
-        "\n----------------------------------------------"
+        "--------------------------------------------------"
       );
 
       console.log(
-        "📡 [EVENT] deviceConnected"
+        "📡 EVENT: deviceConnected"
       );
 
       console.log(
-        "----------------------------------------------"
+        "--------------------------------------------------"
       );
 
       console.log(
-        "Socket :",
+        "Socket:",
         socket.id
       );
 
       console.log(
-        "Client :",
-        clientInfo.clientType
-      );
-
-      console.log(
-        "Data   :",
+        "Data:",
         data
       );
 
       let parsedData = data;
 
-      // Parse JSON string if required
+      // -----------------------------------------------
+      // Parse JSON string
+      // -----------------------------------------------
+
       if (typeof data === "string") {
         try {
-          parsedData =
-            JSON.parse(data);
-        } catch (err) {
+          parsedData = JSON.parse(data);
+        } catch (error) {
           console.error(
-            "❌ JSON Parse Failed:",
-            err.message
+            "❌ JSON parse failed:",
+            error.message
           );
 
           return;
         }
       }
 
-      // Validate device ID
+      // -----------------------------------------------
+      // Validate device
+      // -----------------------------------------------
+
       if (
         !parsedData ||
         !parsedData.deviceId
       ) {
         console.warn(
-          "⚠️ Invalid deviceConnected payload:",
-          data
+          "⚠️ deviceConnected missing deviceId"
         );
 
         return;
@@ -504,10 +577,13 @@ io.on("connection", (socket) => {
       const deviceId =
         parsedData.deviceId;
 
-      // Bind device to socket
+      // Bind socket
       socket.deviceId = deviceId;
 
-      // Save device information
+      const now =
+        new Date().toISOString();
+
+      // Save device
       devices.set(deviceId, {
         deviceId,
 
@@ -519,26 +595,23 @@ io.on("connection", (socket) => {
           clientInfo.clientType,
 
         connectedAt:
-          new Date().toISOString(),
+          now,
 
         lastSeen:
-          new Date().toISOString(),
+          now,
       });
 
-      const activeDevices =
-        Array.from(
-          devices.values()
-        ).filter(
-          (device) =>
-            device.connected === true
-        ).length;
-
+      console.log("");
       console.log(
-        `✅ [ESP32 ONLINE] Device ID: '${deviceId}'`
+        `🟢 ESP32 ONLINE: ${deviceId}`
       );
 
       console.log(
-        `📊 Active Devices: ${activeDevices}`
+        `🔌 Socket: ${socket.id}`
+      );
+
+      console.log(
+        `📊 Registered devices: ${devices.size}`
       );
 
       // Notify frontend
@@ -549,71 +622,66 @@ io.on("connection", (socket) => {
 
           connected: true,
 
-          lastSeen:
-            new Date().toISOString(),
+          lastSeen: now,
         }
       );
 
-      // Print updated status
       printConnectionStatus();
     }
   );
 
   // ===================================================
-  // ESP32 SENSOR TELEMETRY
+  // SENSOR DATA
   // ===================================================
 
   socket.on(
     "sensorData",
     (data) => {
+      console.log("");
       console.log(
-        "\n----------------------------------------------"
+        "--------------------------------------------------"
       );
 
       console.log(
-        "📊 [EVENT] sensorData"
+        "📊 EVENT: sensorData"
       );
 
       console.log(
-        "----------------------------------------------"
-      );
-
-      console.log(
-        "Socket :",
-        socket.id
-      );
-
-      console.log(
-        "Client :",
-        clientInfo.clientType
+        "--------------------------------------------------"
       );
 
       let parsedData = data;
 
-      // Parse JSON string
+      // -----------------------------------------------
+      // Parse JSON
+      // -----------------------------------------------
+
       if (typeof data === "string") {
         try {
-          parsedData =
-            JSON.parse(data);
-        } catch (err) {
+          parsedData = JSON.parse(data);
+        } catch (error) {
           console.error(
-            "❌ JSON Parse Error:",
-            err.message
+            "❌ Sensor JSON parse error:",
+            error.message
           );
 
           return;
         }
       }
 
-      // Validate payload
+      // -----------------------------------------------
+      // Validate
+      // -----------------------------------------------
+
       if (
         !parsedData ||
         !parsedData.deviceId
       ) {
         console.warn(
-          "⚠️ Invalid sensor payload:",
-          data
+          "⚠️ Invalid sensor payload"
         );
+
+        console.warn(data);
 
         return;
       }
@@ -621,9 +689,12 @@ io.on("connection", (socket) => {
       const deviceId =
         parsedData.deviceId;
 
-      // Bind device
-      socket.deviceId =
-        deviceId;
+      const now =
+        new Date().toISOString();
+
+      // -----------------------------------------------
+      // Update device
+      // -----------------------------------------------
 
       const existingDevice =
         devices.get(deviceId);
@@ -641,12 +712,20 @@ io.on("connection", (socket) => {
         clientType:
           clientInfo.clientType,
 
+        connectedAt:
+          existingDevice?.connectedAt ||
+          now,
+
         lastSeen:
-          new Date().toISOString(),
+          now,
       });
 
+      // -----------------------------------------------
+      // Print telemetry
+      // -----------------------------------------------
+
       console.log(
-        `📡 Telemetry received from ESP32: '${deviceId}'`
+        `📡 Telemetry from: ${deviceId}`
       );
 
       console.log(
@@ -689,7 +768,20 @@ io.on("connection", (socket) => {
         parsedData.triggers?.tamper_light
       );
 
-      // Broadcast telemetry to dashboard
+      console.log(
+        "Socket Connected:",
+        socket.connected
+      );
+
+      console.log(
+        "Time:",
+        now
+      );
+
+      // -----------------------------------------------
+      // Broadcast
+      // -----------------------------------------------
+
       io.emit(
         "sensorData",
         parsedData
@@ -698,32 +790,15 @@ io.on("connection", (socket) => {
   );
 
   // ===================================================
-  // FRONTEND: GET DEVICES
+  // GET DEVICES
   // ===================================================
 
   socket.on(
     "getDevices",
     () => {
+      console.log("");
       console.log(
-        "\n----------------------------------------------"
-      );
-
-      console.log(
-        "🖥️ [EVENT] getDevices"
-      );
-
-      console.log(
-        "----------------------------------------------"
-      );
-
-      console.log(
-        "Socket :",
-        socket.id
-      );
-
-      console.log(
-        "Client :",
-        clientInfo.clientType
+        "📋 EVENT: getDevices"
       );
 
       const deviceList =
@@ -737,7 +812,7 @@ io.on("connection", (socket) => {
       );
 
       console.log(
-        `📋 Sent ${deviceList.length} device entries`
+        `📋 Sent ${deviceList.length} devices`
       );
     }
   );
@@ -749,8 +824,9 @@ io.on("connection", (socket) => {
   socket.on(
     "error",
     (error) => {
+      console.error("");
       console.error(
-        "\n=============================================="
+        "=================================================="
       );
 
       console.error(
@@ -758,31 +834,31 @@ io.on("connection", (socket) => {
       );
 
       console.error(
-        "=============================================="
+        "=================================================="
       );
 
       console.error(
-        "Socket :",
+        "Socket:",
         socket.id
       );
 
       console.error(
-        "Client :",
+        "Client:",
         clientInfo.clientType
       );
 
       console.error(
-        "Origin :",
+        "Origin:",
         clientInfo.origin
       );
 
       console.error(
-        "Error  :",
+        "Error:",
         error
       );
 
       console.error(
-        "==============================================\n"
+        "=================================================="
       );
     }
   );
@@ -794,8 +870,9 @@ io.on("connection", (socket) => {
   socket.on(
     "disconnect",
     (reason, details) => {
+      console.log("");
       console.log(
-        "\n=============================================="
+        "=================================================="
       );
 
       console.log(
@@ -803,55 +880,54 @@ io.on("connection", (socket) => {
       );
 
       console.log(
-        "=============================================="
+        "=================================================="
       );
 
       console.log(
-        "Socket ID :",
+        "Socket ID:",
         socket.id
       );
 
       console.log(
-        "Client    :",
+        "Client:",
         clientInfo.clientType
       );
 
       console.log(
-        "Origin    :",
+        "Origin:",
         clientInfo.origin
       );
 
       console.log(
-        "Transport :",
-        socket.conn.transport.name
-      );
-
-      console.log(
-        "Reason    :",
+        "Reason:",
         reason
       );
 
       console.log(
-        "Details   :",
+        "Details:",
         details || "NONE"
       );
 
       console.log(
-        "Time      :",
+        "Time:",
         new Date().toISOString()
       );
 
       console.log(
-        "==============================================\n"
+        "=================================================="
       );
+
+      // -----------------------------------------------
+      // Find device
+      // -----------------------------------------------
 
       const deviceId =
         socket.deviceId;
 
-      // No device ID means frontend/unknown client
+      // No device registered on this socket
       if (!deviceId) {
         console.log(
-          `🖥️ [Frontend/Unknown Client Offline] ${clientInfo.clientType}`
+          `🖥️ Frontend/Unknown client disconnected: ${clientInfo.clientType}`
         );
 
         printConnectionStatus();
@@ -859,15 +935,21 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // ESP32 disconnect
       const device =
         devices.get(deviceId);
 
+      // -----------------------------------------------
+      // Make sure old socket doesn't
+      // overwrite a newer connection
+      // -----------------------------------------------
+
       if (
         device &&
-        device.socketId ===
-          socket.id
+        device.socketId === socket.id
       ) {
+        const now =
+          new Date().toISOString();
+
         devices.set(
           deviceId,
           {
@@ -876,17 +958,22 @@ io.on("connection", (socket) => {
             connected: false,
 
             disconnectedAt:
-              new Date().toISOString(),
+              now,
 
             lastSeen:
-              new Date().toISOString(),
+              now,
           }
         );
 
         console.log(
-          `❌ [ESP32 OFFLINE] Device ID: '${deviceId}'`
+          `🔴 ESP32 OFFLINE: ${deviceId}`
         );
 
+        console.log(
+          `Reason: ${reason}`
+        );
+
+        // Notify frontend
         io.emit(
           "deviceStatus",
           {
@@ -894,48 +981,33 @@ io.on("connection", (socket) => {
 
             connected: false,
 
-            lastSeen:
-              new Date().toISOString(),
+            lastSeen: now,
 
             reason,
           }
         );
       }
 
-      // Print updated status
       printConnectionStatus();
     }
   );
 });
 
 // =====================================================
-// SERVER INITIALIZATION
+// SERVER START
 // =====================================================
 
 server.listen(
   PORT,
   "0.0.0.0",
   () => {
+    console.log("");
     console.log(
       "=================================================="
     );
 
     console.log(
-      "🚀 SiloSense Socket Engine Online!"
-    );
-
-    console.log(
-      `🚀 Port: ${PORT}`
-    );
-
-    console.log(
-      `🌐 Origins Allowed: ${JSON.stringify(
-        allowedOrigins
-      )}`
-    );
-
-    console.log(
-      `🕒 Started At: ${new Date().toISOString()}`
+      "🚀 SILOSENSE SOCKET SERVER STARTED"
     );
 
     console.log(
@@ -943,10 +1015,75 @@ server.listen(
     );
 
     console.log(
-      "📡 Socket.IO is READY and waiting for clients..."
+      "Port:",
+      PORT
     );
 
-    // Print initial status immediately
+    console.log(
+      "Frontend:",
+      normalizedFrontendUrl
+    );
+
+    console.log(
+      "Allowed Origins:",
+      uniqueAllowedOrigins
+    );
+
+    console.log(
+      "Socket.IO Path:",
+      "/socket.io/"
+    );
+
+    console.log(
+      "Transports:",
+      ["websocket", "polling"]
+    );
+
+    console.log(
+      "Started:",
+      new Date().toISOString()
+    );
+
+    console.log(
+      "=================================================="
+    );
+
+    console.log(
+      "📡 Waiting for ESP32 / frontend clients..."
+    );
+
+    console.log(
+      "=================================================="
+    );
+
+    // IMPORTANT:
+    // This prints even when there are ZERO devices.
     printConnectionStatus();
+  }
+);
+
+// =====================================================
+// PROCESS ERROR HANDLERS
+// =====================================================
+
+process.on(
+  "uncaughtException",
+  (error) => {
+    console.error("");
+    console.error(
+      "💥 UNCAUGHT EXCEPTION"
+    );
+    console.error(error);
+  }
+);
+
+process.on(
+  "unhandledRejection",
+  (reason) => {
+    console.error("");
+    console.error(
+      "💥 UNHANDLED PROMISE REJECTION"
+    );
+    console.error(reason);
   }
 );
