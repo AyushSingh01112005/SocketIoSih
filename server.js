@@ -6,12 +6,15 @@ const cors = require("cors");
 const app = express();
 const server = http.createServer(app);
 
-// Allowed origins setup
+// Environment setup
+const PORT = process.env.PORT || 4000;
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://sih-26-cyan.vercel.app";
+const normalizedFrontendUrl = FRONTEND_URL.replace(/\/$/, "");
 
 const allowedOrigins = [
-  FRONTEND_URL,
+  normalizedFrontendUrl,
   "https://sih-26-cyan.vercel.app",
+  "https://sih-26-beta.vercel.app",
   "http://localhost:3000",
   "http://localhost:5000"
 ];
@@ -21,33 +24,44 @@ app.use(express.json());
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow non-browser agents (ESP32, Postman) or listed origins
+      // Allow non-browser agents (ESP32, Postman, server-to-server) or matched origins
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
-      return callback(null, true); // Fallback allow to avoid CORS blocks on WebSockets
+      console.warn(`[CORS Warning] Request Origin not in whitelist: ${origin}`);
+      return callback(null, true); 
     },
     methods: ["GET", "POST"],
     credentials: true
   })
 );
 
-// Socket.IO Setup optimized for ESP32 and Cloud Proxies (Render)
+// Socket.IO Server Setup
 const io = new Server(server, {
   cors: {
-    origin: "*", 
-    methods: ["GET", "POST"]
+    origin: allowedOrigins,
+    methods: ["GET", "POST"],
+    credentials: true
   },
-  allowEIO3: true,        // Compatibility for older C++ SocketIOclient implementations
-  pingInterval: 10000,    // 10s: Gives ESP32 CPU time to handle SSL without timing out
-  pingTimeout: 5000,      // 5s: Prevents false-disconnects on Render network jitter
+  allowEIO3: true,         // Compatibility for ESP32 SocketIOclient library
+  pingInterval: 25000,     // Keeps cloud proxies (Render) alive
+  pingTimeout: 20000,      // Prevents premature drops on TLS latency
   transports: ["websocket", "polling"]
 });
 
-// Device state tracking map
+// Device Tracking Memory Map
 const devices = new Map();
 
-// Health Check Endpoint
+// =====================================================
+// HTTP ROUTES & LOGGING
+// =====================================================
+
+app.use((req, res, next) => {
+  console.log(`[HTTP Request] ${new Date().toISOString()} | ${req.method} ${req.url} | IP: ${req.ip}`);
+  next();
+});
+
+// Server Health Endpoint
 app.get("/", (req, res) => {
   res.status(200).json({
     success: true,
@@ -58,29 +72,54 @@ app.get("/", (req, res) => {
   });
 });
 
-// Socket Event Loop
-io.on("connection", (socket) => {
-  console.log(`[Socket.IO] Client connected: ${socket.id}`);
+// Internal Endpoint (Triggered from Next.js Vercel API)
+app.post("/internal/sensor-saved", (req, res) => {
+  console.log("[HTTP Log] POST /internal/sensor-saved -> Event received");
+  const data = req.body;
 
-  // Device Registration
+  if (!data) {
+    console.error("[HTTP Error] POST /internal/sensor-saved -> Missing body payload!");
+    return res.status(400).json({ success: false, message: "Invalid payload" });
+  }
+
+  console.log("📡 [Broadcast] Emitting 'sensor:saved' to all clients");
+  io.emit("sensor:saved", data);
+  
+  return res.status(200).json({ success: true, message: "Sensor event emitted successfully" });
+});
+
+// =====================================================
+// SOCKET.IO REAL-TIME EVENT ENGINE
+// =====================================================
+
+io.on("connection", (socket) => {
+  const transportName = socket.conn.transport.name;
+  console.log(`\n🟢 [Socket Connected] ID: ${socket.id} | IP: ${socket.handshake.address} | Transport: ${transportName}`);
+
+  socket.conn.on("upgrade", (transport) => {
+    console.log(`⚡ [Socket Upgraded] ID: ${socket.id} -> Switched to ${transport.name}`);
+  });
+
+  // 1. ESP32 Device Registration Handler
   socket.on("deviceConnected", (data) => {
+    console.log(`\n📥 [Event: deviceConnected] Socket: ${socket.id}`);
     let parsedData = data;
-    
-    // Safety check for raw stringified payloads from microcontrollers
+
     if (typeof data === "string") {
       try {
         parsedData = JSON.parse(data);
       } catch (err) {
-        console.error("[Device] JSON parse error:", err);
+        console.error("  └─ ❌ [JSON Parse Failed]:", err.message);
       }
     }
 
     if (!parsedData || !parsedData.deviceId) {
-      console.warn("[Device] Invalid deviceConnected payload:", data);
+      console.warn("  └─ ⚠️ [Invalid Payload] Rejected! Missing 'deviceId':", data);
       return;
     }
 
     const deviceId = parsedData.deviceId;
+    socket.deviceId = deviceId; // Bind deviceId to socket instance
 
     devices.set(deviceId, {
       deviceId,
@@ -90,10 +129,8 @@ io.on("connection", (socket) => {
       lastSeen: new Date().toISOString()
     });
 
-    socket.deviceId = deviceId;
-    console.log(`[Device] ${deviceId} CONNECTED`);
+    console.log(`✅ [Device Online] ID: '${deviceId}' | Active Nodes: ${devices.size}`);
 
-    // Broadcast update to frontend clients
     io.emit("deviceStatus", {
       deviceId,
       connected: true,
@@ -101,24 +138,27 @@ io.on("connection", (socket) => {
     });
   });
 
-  // Sensor Telemetry Receiver
+  // 2. ESP32 Sensor Telemetry Handler
   socket.on("sensorData", (data) => {
+    console.log(`\n📊 [Event: sensorData] Socket: ${socket.id}`);
     let parsedData = data;
 
     if (typeof data === "string") {
       try {
         parsedData = JSON.parse(data);
       } catch (err) {
-        console.error("[Sensor] JSON parse error:", err);
+        console.error("  └─ ❌ [JSON Parse Error]:", err.message);
       }
     }
 
     if (!parsedData || !parsedData.deviceId) {
-      console.warn("[Sensor] Invalid sensor data received:", data);
+      console.warn("  └─ ⚠️ [Invalid Payload] Rejected! Data:", data);
       return;
     }
 
     const deviceId = parsedData.deviceId;
+    socket.deviceId = deviceId; // Bind deviceId safety check
+
     const existingDevice = devices.get(deviceId);
 
     devices.set(deviceId, {
@@ -129,18 +169,28 @@ io.on("connection", (socket) => {
       lastSeen: new Date().toISOString()
     });
 
-    // Relay telemetry live to Next.js / React frontend
+    console.log(`  └─ Telemetry Relayed for '${deviceId}'`);
+
+    // Broadcast to UI subscribers
     io.emit("sensorData", parsedData);
   });
 
-  // Dashboard state request handler
+  // 3. Next.js Dashboard Active Devices Query
   socket.on("getDevices", () => {
-    socket.emit("deviceList", Array.from(devices.values()));
+    console.log(`\n📋 [Event: getDevices] Socket: ${socket.id}`);
+    const deviceList = Array.from(devices.values());
+    socket.emit("deviceList", deviceList);
+    console.log(`  └─ Sent ${deviceList.length} device entry(ies)`);
   });
 
-  // Disconnect Handler
+  // 4. Socket Error Logging
+  socket.on("error", (error) => {
+    console.error(`\n🔴 [Socket Error] ID: ${socket.id} | Error:`, error);
+  });
+
+  // 5. Client Disconnect Handler
   socket.on("disconnect", (reason) => {
-    console.log(`[Socket.IO] Disconnected: ${socket.id} | Reason: ${reason}`);
+    console.log(`\n🟡 [Client Disconnected] ID: ${socket.id} | Reason: ${reason}`);
 
     const deviceId = socket.deviceId;
     if (!deviceId) return;
@@ -154,19 +204,25 @@ io.on("connection", (socket) => {
         lastSeen: new Date().toISOString()
       });
 
+      console.log(`❌ [Device Offline] ID: '${deviceId}' marked DISCONNECTED`);
+
       io.emit("deviceStatus", {
         deviceId,
         connected: false,
         lastSeen: new Date().toISOString(),
         reason
       });
-
-      console.log(`[Device] ${deviceId} DISCONNECTED`);
     }
   });
 });
 
-const PORT = process.env.PORT || 4000;
+// =====================================================
+// SERVER INITIALIZATION
+// =====================================================
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`SiloSense Socket Server running on port ${PORT}`);
+  console.log("==================================================");
+  console.log(`🚀 SiloSense Socket Engine Online! Port: ${PORT}`);
+  console.log(`🌐 Origins Allowed: ${JSON.stringify(allowedOrigins)}`);
+  console.log(`🕒 Started At: ${new Date().toISOString()}`);
+  console.log("==================================================");
 });
