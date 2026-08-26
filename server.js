@@ -4,245 +4,168 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 
 const app = express();
-
 const server = http.createServer(app);
 
-// =====================================================
-// CORS
-// =====================================================
+// Allowed origins setup
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://sih-26-cyan.vercel.app";
 
-const FRONTEND_URL =
-    process.env.FRONTEND_URL ||
-    "https://sih-26-cyan.vercel.app";
+const allowedOrigins = [
+  FRONTEND_URL,
+  "https://sih-26-cyan.vercel.app",
+  "http://localhost:3000",
+  "http://localhost:5000"
+];
 
+// Express Middleware
+app.use(express.json());
 app.use(
-    cors({
-        origin: FRONTEND_URL,
-        methods: ["GET", "POST"],
-    })
+  cors({
+    origin: (origin, callback) => {
+      // Allow non-browser agents (e.g. ESP32, Postman) or listed origins
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(null, true); // Fallback allow to avoid CORS block on sockets
+    },
+    methods: ["GET", "POST"],
+    credentials: true
+  })
 );
 
+// Socket.IO Setup with backward compatibility for ESP32
 const io = new Server(server, {
-    cors: {
-        origin: FRONTEND_URL,
-        methods: ["GET", "POST"],
-    },
-
-    // Keep connections alive
-    pingInterval: 25000,
-    pingTimeout: 20000,
-
-    transports: ["websocket", "polling"],
+  cors: {
+    origin: "*", // Wide open for WebSockets to allow C++ microcontrollers
+    methods: ["GET", "POST"]
+  },
+  allowEIO3: true, // CRITICAL: Enables compatibility for ESP32 SocketIOclient library
+  pingInterval: 10000,
+  pingTimeout: 10000,
+  transports: ["websocket", "polling"]
 });
 
-// =====================================================
-// DEVICE STATE
-// =====================================================
-
+// Device state tracking
 const devices = new Map();
 
-// =====================================================
-// HEALTH CHECK
-// =====================================================
-
+// Health Check
 app.get("/", (req, res) => {
-    res.status(200).json({
-        success: true,
-        service: "SiloSense Socket Server",
-        status: "running",
-        timestamp: new Date().toISOString(),
-    });
+  res.status(200).json({
+    success: true,
+    service: "SiloSense Socket Server",
+    status: "running",
+    connectedDevices: devices.size,
+    timestamp: new Date().toISOString()
+  });
 });
 
-// =====================================================
-// SOCKET.IO
-// =====================================================
-
+// Socket Event Loop
 io.on("connection", (socket) => {
+  console.log(`[Socket.IO] Client connected: ${socket.id}`);
 
-    console.log(
-        `[Socket.IO] Client connected: ${socket.id}`
-    );
+  // Device Registration
+  socket.on("deviceConnected", (data) => {
+    let parsedData = data;
+    
+    // Parse stringified JSON payloads sent by microcontrollers
+    if (typeof data === "string") {
+      try {
+        parsedData = JSON.parse(data);
+      } catch (err) {
+        console.error("[Device] JSON parse error:", err);
+      }
+    }
 
-    // =================================================
-    // DEVICE CONNECTED
-    // =================================================
+    if (!parsedData || !parsedData.deviceId) {
+      console.warn("[Device] Invalid deviceConnected payload:", data);
+      return;
+    }
 
-    socket.on("deviceConnected", (data) => {
+    const deviceId = parsedData.deviceId;
 
-        if (!data || !data.deviceId) {
-
-            console.warn(
-                "[Device] Invalid deviceConnected payload"
-            );
-
-            return;
-        }
-
-        const deviceId = data.deviceId;
-
-        // Store device
-        devices.set(deviceId, {
-            deviceId,
-            socketId: socket.id,
-            connected: true,
-            connectedAt: new Date().toISOString(),
-            lastSeen: new Date().toISOString(),
-        });
-
-        // Attach device ID to socket
-        socket.deviceId = deviceId;
-
-        console.log(
-            `[Device] ${deviceId} CONNECTED`
-        );
-
-        // =============================================
-        // INFORM ALL DASHBOARD CLIENTS
-        // =============================================
-
-        io.emit("deviceStatus", {
-            deviceId,
-            connected: true,
-            lastSeen: new Date().toISOString(),
-        });
+    devices.set(deviceId, {
+      deviceId,
+      socketId: socket.id,
+      connected: true,
+      connectedAt: new Date().toISOString(),
+      lastSeen: new Date().toISOString()
     });
 
-    // =================================================
-    // SENSOR DATA
-    // =================================================
+    socket.deviceId = deviceId;
+    console.log(`[Device] ${deviceId} CONNECTED`);
 
-    socket.on("sensorData", (data) => {
+    io.emit("deviceStatus", {
+      deviceId,
+      connected: true,
+      lastSeen: new Date().toISOString()
+    });
+  });
 
-        if (!data || !data.deviceId) {
+  // Sensor Data Telemetry
+  socket.on("sensorData", (data) => {
+    let parsedData = data;
 
-            console.warn(
-                "[Sensor] Invalid sensor data"
-            );
+    if (typeof data === "string") {
+      try {
+        parsedData = JSON.parse(data);
+      } catch (err) {
+        console.error("[Sensor] JSON parse error:", err);
+      }
+    }
 
-            return;
-        }
+    if (!parsedData || !parsedData.deviceId) {
+      console.warn("[Sensor] Invalid sensor data received:", data);
+      return;
+    }
 
-        const deviceId = data.deviceId;
+    const deviceId = parsedData.deviceId;
+    const existingDevice = devices.get(deviceId);
 
-        // Update last seen
-        const existingDevice =
-            devices.get(deviceId);
-
-        devices.set(deviceId, {
-            ...(existingDevice || {}),
-            deviceId,
-            socketId: socket.id,
-            connected: true,
-            lastSeen: new Date().toISOString(),
-        });
-
-        // =============================================
-        // SEND SENSOR DATA TO DASHBOARD
-        // =============================================
-
-        io.emit(
-            "sensorData",
-            data
-        );
+    devices.set(deviceId, {
+      ...(existingDevice || {}),
+      deviceId,
+      socketId: socket.id,
+      connected: true,
+      lastSeen: new Date().toISOString()
     });
 
-    // =================================================
-    // DASHBOARD REQUESTS CURRENT DEVICES
-    // =================================================
+    // Relay data to Vercel Next.js/React frontend dashboard
+    io.emit("sensorData", parsedData);
+  });
 
-    socket.on("getDevices", () => {
+  // Dashboard Request
+  socket.on("getDevices", () => {
+    socket.emit("deviceList", Array.from(devices.values()));
+  });
 
-        socket.emit(
-            "deviceList",
-            Array.from(
-                devices.values()
-            )
-        );
-    });
+  // Disconnect Handler
+  socket.on("disconnect", (reason) => {
+    console.log(`[Socket.IO] Disconnected: ${socket.id} | Reason: ${reason}`);
 
-    // =================================================
-    // DISCONNECT
-    // =================================================
+    const deviceId = socket.deviceId;
+    if (!deviceId) return;
 
-    socket.on("disconnect", (reason) => {
+    const device = devices.get(deviceId);
+    if (device && device.socketId === socket.id) {
+      devices.set(deviceId, {
+        ...device,
+        connected: false,
+        disconnectedAt: new Date().toISOString(),
+        lastSeen: new Date().toISOString()
+      });
 
-        console.log(
-            `[Socket.IO] Client disconnected: ${socket.id}`
-        );
+      io.emit("deviceStatus", {
+        deviceId,
+        connected: false,
+        lastSeen: new Date().toISOString(),
+        reason
+      });
 
-        console.log(
-            `[Socket.IO] Reason: ${reason}`
-        );
-
-        const deviceId =
-            socket.deviceId;
-
-        if (!deviceId) {
-
-            return;
-        }
-
-        const device =
-            devices.get(deviceId);
-
-        // Only mark offline if this socket is
-        // still the socket registered for device.
-
-        if (
-            device &&
-            device.socketId === socket.id
-        ) {
-
-            devices.set(deviceId, {
-                ...device,
-                connected: false,
-                disconnectedAt:
-                    new Date().toISOString(),
-                lastSeen:
-                    new Date().toISOString(),
-            });
-
-            // =========================================
-            // INFORM DASHBOARD
-            // =========================================
-
-            io.emit(
-                "deviceStatus",
-                {
-                    deviceId,
-                    connected: false,
-                    lastSeen:
-                        new Date().toISOString(),
-                    reason,
-                }
-            );
-
-            console.log(
-                `[Device] ${deviceId} DISCONNECTED`
-            );
-        }
-    });
+      console.log(`[Device] ${deviceId} DISCONNECTED`);
+    }
+  });
 });
 
-// =====================================================
-// SERVER
-// =====================================================
-
-const PORT =
-    process.env.PORT || 4000;
-
-server.listen(
-    PORT,
-    "0.0.0.0",
-    () => {
-
-        console.log(
-            `SiloSense Socket Server listening on port ${PORT}`
-        );
-
-        console.log(
-            `Frontend: ${FRONTEND_URL}`
-        );
-    }
-);
+const PORT = process.env.PORT || 4000;
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`SiloSense Socket Server running on port ${PORT}`);
+});
