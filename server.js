@@ -87,7 +87,7 @@ const io = new Server(server, {
   pingTimeout: 20000,
 
   // Allow both transports
-  transports: ["websocket", "polling"],
+  transports: ["websocket"],
 
   connectTimeout: 45000,
 });
